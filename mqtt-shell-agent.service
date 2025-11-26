@@ -10,8 +10,12 @@ Group=mqttshell
 WorkingDirectory=/opt/mqtt-shell
 
 # Environment variables for credentials
+Environment="MQTT_HOST=broker.example.com"
+Environment="MQTT_PORT=1883"
 Environment="MQTT_USER=yourusername"
-Environment="MQTT_PASS=yourpassword"
+Environment="MQTT_PASSWORD=your-broker-password"
+Environment="MQTT_AGENT_PASSWORD=unique-agent-secret"
+Environment="MQTT_ID=agent-01"
 
 ExecStart=/usr/bin/python3 /opt/mqtt-shell/mqtt_shell_agent.py
 

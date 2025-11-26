@@ -9,10 +9,13 @@ import signal
 import paho.mqtt.client as mqtt
 
 # ==== CONFIG ====
-BROKER_HOST = os.environ.get("MQTT_HOST")      # your Fairbanks broker
-BROKER_PORT = 1883           # or 1883 if you're not using TLS
+_raw_host = os.environ.get("MQTT_HOST")
+# Guard against missing/blank host to avoid paho's "Invalid host" error.
+BROKER_HOST = _raw_host.strip() if _raw_host else None
+BROKER_PORT = int(os.environ.get("MQTT_PORT", "1883"))  # or 1883 if you're not using TLS
 USERNAME = os.environ.get("MQTT_USER")
-PASSWORD = os.environ.get("MQTT_PASS")
+PASSWORD = os.environ.get("MQTT_PASSWORD") or os.environ.get("MQTT_PASS")
+AGENT_PASSWORD = os.environ.get("MQTT_AGENT_PASSWORD") or os.environ.get("AGENT_PASSWORD")
 USE_TLS     = False           # set False if you're not using TLS
 
 SESSION_ID  = os.environ.get("MQTT_ID")   # identifying string for this machine
@@ -20,11 +23,15 @@ TOPIC_BASE  = f"mqtt-shell/{SESSION_ID}"
 TOPIC_STDIN = TOPIC_BASE + "/stdin"
 TOPIC_STDOUT = TOPIC_BASE + "/stdout"
 TOPIC_STATUS = TOPIC_BASE + "/status"
+TOPIC_AUTH = TOPIC_BASE + "/auth"
 # ==============
 
 client = None
 master_fd = None
 shell_proc = None
+authenticated = False
+auth_notice_sent = False
+AGENT_PASSWORD_BYTES = AGENT_PASSWORD.encode("utf-8") if AGENT_PASSWORD else None
 
 def start_shell():
     global master_fd, shell_proc
@@ -68,12 +75,26 @@ def shell_reader():
 
 def on_connect(mqttc, userdata, flags, reason_code, properties=None):
     print("Connected to broker with code:", reason_code)
-    mqttc.subscribe(TOPIC_STDIN, qos=0)
+    mqttc.subscribe([(TOPIC_STDIN, 0), (TOPIC_AUTH, 1)])
     mqttc.publish(TOPIC_STATUS, "agent-online".encode("utf-8"), qos=1)
 
 def on_message(mqttc, userdata, msg):
-    global master_fd, shell_proc
+    global master_fd, shell_proc, authenticated, auth_notice_sent
+    if msg.topic == TOPIC_AUTH:
+        if msg.payload == AGENT_PASSWORD_BYTES:
+            authenticated = True
+            auth_notice_sent = False
+            mqttc.publish(TOPIC_STATUS, "auth-ok".encode("utf-8"), qos=1)
+        else:
+            mqttc.publish(TOPIC_STATUS, "auth-fail".encode("utf-8"), qos=1)
+        return
+
     if msg.topic == TOPIC_STDIN and master_fd is not None:
+        if not authenticated:
+            if not auth_notice_sent:
+                mqttc.publish(TOPIC_STATUS, "auth-required".encode("utf-8"), qos=1)
+                auth_notice_sent = True
+            return
         # Write raw bytes into PTY
         try:
             os.write(master_fd, msg.payload)
@@ -83,6 +104,22 @@ def on_message(mqttc, userdata, msg):
 def setup_mqtt():
     global client
     client = mqtt.Client(client_id=f"mqtt-shell-agent-{SESSION_ID}", protocol=mqtt.MQTTv5)
+
+    if not BROKER_HOST:
+        print("MQTT_HOST is not set or is empty; please configure a broker host.", file=sys.stderr)
+        sys.exit(1)
+
+    if not SESSION_ID:
+        print("MQTT_ID is not set; please provide a unique identifier for this agent.", file=sys.stderr)
+        sys.exit(1)
+
+    if not PASSWORD:
+        print("MQTT_PASSWORD is not set; refusing to connect without broker credentials.", file=sys.stderr)
+        sys.exit(1)
+
+    if not AGENT_PASSWORD:
+        print("MQTT_AGENT_PASSWORD is not set; refusing to start without an agent password.", file=sys.stderr)
+        sys.exit(1)
 
     if USERNAME:
         client.username_pw_set(USERNAME, PASSWORD)
