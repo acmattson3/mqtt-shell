@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import sys
+import select
 import termios
 import tty
 import queue
@@ -9,6 +10,7 @@ import getpass
 import paho.mqtt.client as mqtt
 
 # ==== STATIC CONFIG (things you probably won't change often) ====
+# Broker can be overridden by CLI target; start with env default.
 BROKER_HOST = os.environ.get("MQTT_HOST")
 BROKER_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 USE_TLS     = False
@@ -17,6 +19,7 @@ USE_TLS     = False
 # These will be set at runtime after parsing the ssh-style target
 USERNAME    = None
 SESSION_ID  = None
+MQTT_USERNAME = os.environ.get("MQTT_USER") or os.environ.get("MQTT_USERNAME")
 MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD") or os.environ.get("MQTT_PASS")
 AGENT_PASSWORD = os.environ.get("MQTT_AGENT_PASSWORD") or os.environ.get("AGENT_PASSWORD")
 
@@ -24,6 +27,7 @@ client = None
 stdout_queue: "queue.Queue[bytes]" = queue.Queue()
 connected_event = threading.Event()
 auth_ok_event = threading.Event()
+remote_exit_event = threading.Event()
 
 # These are computed after SESSION_ID is known
 TOPIC_BASE  = None
@@ -46,25 +50,29 @@ def build_topics():
 
 def parse_target_arg(argv):
     """
-    Parse ssh-like target: [user@]host
+    Parse ssh-like target: [mqtt-user@]<agent-id>@<broker-host>
 
-    - user -> MQTT username
-    - host -> SESSION_ID (remote agent ID)
+    - mqtt-user (optional) -> MQTT username override
+    - agent-id -> SESSION_ID (remote agent ID and topic suffix)
+    - broker-host -> MQTT broker hostname
     """
     if len(argv) < 2:
-        print("Usage: mqtt_shell_client.py [user@]session_id", file=sys.stderr)
+        print("Usage: mqtt_shell_client.py [mqtt-user@]<agent-id>@<broker-host>", file=sys.stderr)
         sys.exit(1)
 
     target = argv[1]
+    parts = target.split("@")
 
-    if "@" in target:
-        user, host = target.split("@", 1)
+    if len(parts) == 2:
+        agent_id, broker_host = parts
+        user = None
+    elif len(parts) == 3:
+        user, agent_id, broker_host = parts
     else:
-        # default username = local user
-        user = getpass.getuser()
-        host = target
+        print("Target must look like [mqtt-user@]<agent-id>@<broker-host>", file=sys.stderr)
+        sys.exit(1)
 
-    return user, host
+    return user, agent_id, broker_host
 
 
 def on_connect(mqttc, userdata, flags, reason_code, properties=None):
@@ -84,6 +92,8 @@ def on_message(mqttc, userdata, msg):
         print(f"[status] {text}", file=sys.stderr)
         if text == "auth-ok":
             auth_ok_event.set()
+        if text == "shell-exited":
+            remote_exit_event.set()
 
 
 def setup_mqtt():
@@ -114,10 +124,24 @@ def writer_loop():
 
 
 def main():
-    global USERNAME, SESSION_ID, MQTT_PASSWORD, AGENT_PASSWORD
+    global USERNAME, SESSION_ID, MQTT_PASSWORD, AGENT_PASSWORD, BROKER_HOST
 
     # Parse [user@]session_id from command line
-    USERNAME, SESSION_ID = parse_target_arg(sys.argv)
+    user_override, agent_id, broker_host = parse_target_arg(sys.argv)
+    SESSION_ID = agent_id
+    BROKER_HOST = broker_host or BROKER_HOST
+
+    if not BROKER_HOST:
+        print("MQTT broker host is missing; set MQTT_HOST or include it in the target.", file=sys.stderr)
+        sys.exit(1)
+
+    # Resolve MQTT username: CLI override > env > prompt
+    USERNAME = user_override or MQTT_USERNAME
+    if not USERNAME:
+        USERNAME = input("MQTT broker username: ").strip()
+    if not USERNAME:
+        print("MQTT broker username is required.", file=sys.stderr)
+        sys.exit(1)
 
     if not MQTT_PASSWORD:
         MQTT_PASSWORD = getpass.getpass("MQTT broker password: ")
@@ -152,10 +176,15 @@ def main():
 
     try:
         while True:
-            data = os.read(fd, 1024)
-            if not data:
+            if remote_exit_event.is_set():
                 break
-            client.publish(TOPIC_STDIN, data, qos=0)
+
+            rlist, _, _ = select.select([fd], [], [], 0.1)
+            if fd in rlist:
+                data = os.read(fd, 1024)
+                if not data:
+                    break
+                client.publish(TOPIC_STDIN, data, qos=0)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
         stdout_queue.put(None)

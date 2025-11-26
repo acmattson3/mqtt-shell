@@ -41,12 +41,16 @@ def start_shell():
 
     # Spawn default shell
     shell = os.environ.get("SHELL", "/bin/bash")
+    env = os.environ.copy()
+    env.setdefault("TERM", "xterm-256color")
     shell_proc = subprocess.Popen(
         [shell],
         stdin=slave_fd,
         stdout=slave_fd,
         stderr=slave_fd,
-        close_fds=True
+        close_fds=True,
+        preexec_fn=os.setsid,  # give the shell a session and controlling TTY
+        env=env,
     )
     os.close(slave_fd)
 

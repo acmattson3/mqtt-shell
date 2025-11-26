@@ -22,12 +22,11 @@ ExecStart=/usr/bin/python3 /opt/mqtt-shell/mqtt_shell_agent.py
 Restart=always
 RestartSec=3
 
-# Hardening (optional but recommended)
-NoNewPrivileges=true
+# Hardening (optional; relax these if you need full login behavior)
+NoNewPrivileges=false
 PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/opt/mqtt-shell
+ProtectSystem=off
+ProtectHome=false
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 SystemCallArchitectures=native
 
