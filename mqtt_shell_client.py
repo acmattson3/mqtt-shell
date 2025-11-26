@@ -98,7 +98,11 @@ def on_message(mqttc, userdata, msg):
 
 def setup_mqtt():
     global client
-    client = mqtt.Client(client_id="mqtt-shell-client", protocol=mqtt.MQTTv5)
+    client = mqtt.Client(
+        client_id="mqtt-shell-client",
+        protocol=mqtt.MQTTv5,
+        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+    )
 
     if USERNAME:
         client.username_pw_set(USERNAME, MQTT_PASSWORD)

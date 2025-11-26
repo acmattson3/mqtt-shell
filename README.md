@@ -50,6 +50,7 @@ sudo systemctl enable --now mqtt-shell-agent
 sudo systemctl status mqtt-shell-agent
 ```
 The bundled service file is tuned for an SSH-like experience (no `NoNewPrivileges`, `ProtectHome=false`, `ProtectSystem=off`) so `sudo`, login shell config, and colors work as expected. If you want a more locked-down service, re-enable those hardening directives after testing.
+If you see permission errors like `Permission denied` when reading `~/.bashrc` or `cd ~`, double-check that `ProtectHome=false` in the unit file and that the service user actually owns its home directory.
 
 ## Running the client
 ```bash

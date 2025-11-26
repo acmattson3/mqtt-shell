@@ -43,6 +43,7 @@ def start_shell():
     shell = os.environ.get("SHELL", "/bin/bash")
     env = os.environ.copy()
     env.setdefault("TERM", "xterm-256color")
+    env.setdefault("HOME", os.path.expanduser("~"))
     shell_proc = subprocess.Popen(
         [shell],
         stdin=slave_fd,
@@ -89,6 +90,13 @@ def on_message(mqttc, userdata, msg):
             authenticated = True
             auth_notice_sent = False
             mqttc.publish(TOPIC_STATUS, "auth-ok".encode("utf-8"), qos=1)
+            # Nudge the PTY so the user sees a prompt even if the shell
+            # started before they connected.
+            if master_fd is not None:
+                try:
+                    os.write(master_fd, b"\n")
+                except OSError:
+                    pass
         else:
             mqttc.publish(TOPIC_STATUS, "auth-fail".encode("utf-8"), qos=1)
         return
@@ -107,7 +115,11 @@ def on_message(mqttc, userdata, msg):
 
 def setup_mqtt():
     global client
-    client = mqtt.Client(client_id=f"mqtt-shell-agent-{SESSION_ID}", protocol=mqtt.MQTTv5)
+    client = mqtt.Client(
+        client_id=f"mqtt-shell-agent-{SESSION_ID}",
+        protocol=mqtt.MQTTv5,
+        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+    )
 
     if not BROKER_HOST:
         print("MQTT_HOST is not set or is empty; please configure a broker host.", file=sys.stderr)
@@ -146,17 +158,17 @@ def main():
     reader_thread = threading.Thread(target=shell_reader, daemon=True)
     reader_thread.start()
 
-    # Just keep the main thread alive while MQTT loop and reader thread run
     try:
-        while True:
-            if shell_proc.poll() is not None:
-                break
-            signal.pause()
+        # Wait for the shell to exit instead of blocking on signals so the client
+        # sees a clean shutdown when the user runs `exit`.
+        shell_proc.wait()
     except KeyboardInterrupt:
         pass
     finally:
         if shell_proc and shell_proc.poll() is None:
             shell_proc.terminate()
+        if reader_thread.is_alive():
+            reader_thread.join(timeout=1)
         if client:
             client.loop_stop()
             client.disconnect()
