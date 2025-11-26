@@ -9,9 +9,9 @@ import getpass
 import paho.mqtt.client as mqtt
 
 # ==== STATIC CONFIG (things you probably won't change often) ====
-BROKER_HOST = "sssn.us"
+BROKER_HOST = "yourhostname"
 BROKER_PORT = 1883
-USE_TLS     = True
+USE_TLS     = False
 # ================================================================
 
 # These will be set at runtime after parsing the ssh-style target
