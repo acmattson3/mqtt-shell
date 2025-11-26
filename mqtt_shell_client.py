@@ -7,6 +7,7 @@ import tty
 import queue
 import threading
 import getpass
+import uuid
 import paho.mqtt.client as mqtt
 
 # ==== STATIC CONFIG (things you probably won't change often) ====
@@ -98,8 +99,11 @@ def on_message(mqttc, userdata, msg):
 
 def setup_mqtt():
     global client
+    # Give each client connection a unique ID so multiple sessions do not kick
+    # each other off the broker and enter a reconnect loop.
+    client_id = f"mqtt-shell-client-{SESSION_ID}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
     client = mqtt.Client(
-        client_id="mqtt-shell-client",
+        client_id=client_id,
         protocol=mqtt.MQTTv5,
         callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
     )

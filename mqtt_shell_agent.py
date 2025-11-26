@@ -6,7 +6,9 @@ import select
 import subprocess
 import threading
 import signal
+import time
 import paho.mqtt.client as mqtt
+from typing import Optional
 
 # ==== CONFIG ====
 _raw_host = os.environ.get("MQTT_HOST")
@@ -29,54 +31,88 @@ TOPIC_AUTH = TOPIC_BASE + "/auth"
 client = None
 master_fd = None
 shell_proc = None
+shell_thread: Optional[threading.Thread] = None
 authenticated = False
 auth_notice_sent = False
 AGENT_PASSWORD_BYTES = AGENT_PASSWORD.encode("utf-8") if AGENT_PASSWORD else None
+shell_lock = threading.Lock()
+
+def choose_start_dir():
+    """Prefer HOME if executable, otherwise stay in current working dir."""
+    home_dir = os.environ.get("HOME") or os.path.expanduser("~")
+    if home_dir and os.access(home_dir, os.X_OK):
+        return home_dir
+    return None
+
 
 def start_shell():
-    global master_fd, shell_proc
+    """Start a fresh PTY-backed shell after successful auth."""
+    global master_fd, shell_proc, shell_thread
 
-    # Create PTY
-    master_fd, slave_fd = pty.openpty()
+    with shell_lock:
+        # Avoid starting multiple shells if auth races
+        if shell_proc and shell_proc.poll() is None:
+            return
 
-    # Spawn default shell
-    shell = os.environ.get("SHELL", "/bin/bash")
-    env = os.environ.copy()
-    env.setdefault("TERM", "xterm-256color")
-    env.setdefault("HOME", os.path.expanduser("~"))
-    shell_proc = subprocess.Popen(
-        [shell],
-        stdin=slave_fd,
-        stdout=slave_fd,
-        stderr=slave_fd,
-        close_fds=True,
-        preexec_fn=os.setsid,  # give the shell a session and controlling TTY
-        env=env,
-    )
-    os.close(slave_fd)
+        # Create PTY
+        master_fd, slave_fd = pty.openpty()
+
+        # Spawn default shell
+        shell = os.environ.get("SHELL", "/bin/bash")
+        env = os.environ.copy()
+        env.setdefault("TERM", "xterm-256color")
+        env.setdefault("HOME", os.path.expanduser("~"))
+        start_dir = choose_start_dir()
+        shell_proc = subprocess.Popen(
+            [shell],
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            close_fds=True,
+            preexec_fn=os.setsid,  # give the shell a session and controlling TTY
+            env=env,
+            cwd=start_dir,
+        )
+        os.close(slave_fd)
+
+        shell_thread = threading.Thread(target=shell_reader, daemon=True)
+        shell_thread.start()
 
 def shell_reader():
     """Read from PTY and publish to MQTT."""
-    global master_fd, shell_proc, client
+    global master_fd, shell_proc, client, shell_thread, authenticated, auth_notice_sent
 
     bufsize = 1024
-    while True:
-        if shell_proc.poll() is not None:
-            # Shell has exited
-            client.publish(TOPIC_STATUS, "shell-exited".encode("utf-8"), qos=1)
-            break
-
-        rlist, _, _ = select.select([master_fd], [], [], 0.1)
-        if master_fd in rlist:
-            try:
-                data = os.read(master_fd, bufsize)
-            except OSError:
+    try:
+        while True:
+            if shell_proc.poll() is not None:
+                # Shell has exited
+                client.publish(TOPIC_STATUS, "shell-exited".encode("utf-8"), qos=1)
                 break
 
-            if not data:
-                break
+            rlist, _, _ = select.select([master_fd], [], [], 0.1)
+            if master_fd in rlist:
+                try:
+                    data = os.read(master_fd, bufsize)
+                except OSError:
+                    break
 
-            client.publish(TOPIC_STDOUT, data, qos=0)
+                if not data:
+                    break
+
+                client.publish(TOPIC_STDOUT, data, qos=0)
+    finally:
+        with shell_lock:
+            if master_fd is not None:
+                try:
+                    os.close(master_fd)
+                except OSError:
+                    pass
+            master_fd = None
+            shell_proc = None
+            shell_thread = None
+            authenticated = False
+            auth_notice_sent = False
 
 def on_connect(mqttc, userdata, flags, reason_code, properties=None):
     print("Connected to broker with code:", reason_code)
@@ -90,6 +126,7 @@ def on_message(mqttc, userdata, msg):
             authenticated = True
             auth_notice_sent = False
             mqttc.publish(TOPIC_STATUS, "auth-ok".encode("utf-8"), qos=1)
+            start_shell()
             # Nudge the PTY so the user sees a prompt even if the shell
             # started before they connected.
             if master_fd is not None:
@@ -153,22 +190,19 @@ def main():
     signal.signal(signal.SIGINT, signal.SIG_DFL)  # let systemd handle signals normally
 
     setup_mqtt()
-    start_shell()
-
-    reader_thread = threading.Thread(target=shell_reader, daemon=True)
-    reader_thread.start()
 
     try:
-        # Wait for the shell to exit instead of blocking on signals so the client
-        # sees a clean shutdown when the user runs `exit`.
-        shell_proc.wait()
+        # Wait for MQTT loop; shells are spawned after auth. This thread just
+        # idles to keep the process alive.
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
         pass
     finally:
         if shell_proc and shell_proc.poll() is None:
             shell_proc.terminate()
-        if reader_thread.is_alive():
-            reader_thread.join(timeout=1)
+        if shell_thread and shell_thread.is_alive():
+            shell_thread.join(timeout=1)
         if client:
             client.loop_stop()
             client.disconnect()
