@@ -1,0 +1,31 @@
+[Unit]
+Description=MQTT Remote Shell Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mqttshell
+Group=mqttshell
+WorkingDirectory=/opt/mqtt-shell
+
+# Environment variables for credentials
+Environment="MQTT_USER=yourusername"
+Environment="MQTT_PASS=yourpassword"
+
+ExecStart=/usr/bin/python3 /opt/mqtt-shell/mqtt_shell_agent.py
+
+Restart=always
+RestartSec=3
+
+# Hardening (optional but recommended)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/mqtt-shell
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
