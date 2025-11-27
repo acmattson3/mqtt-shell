@@ -111,11 +111,13 @@ def shell_reader():
     global master_fd, shell_proc, client, shell_thread, authenticated, auth_notice_sent
 
     bufsize = 1024
+    status_sent = False
     try:
         while True:
             if shell_proc.poll() is not None:
                 # Shell has exited
                 client.publish(TOPIC_STATUS, "shell-exited".encode("utf-8"), qos=1)
+                status_sent = True
                 break
 
             rlist, _, _ = select.select([master_fd], [], [], 0.1)
@@ -130,6 +132,9 @@ def shell_reader():
 
                 client.publish(TOPIC_STDOUT, data, qos=0)
     finally:
+        if not status_sent and client:
+            # Ensure the client hears about the exit even on unexpected break.
+            client.publish(TOPIC_STATUS, "shell-exited".encode("utf-8"), qos=1)
         with shell_lock:
             if master_fd is not None:
                 try:
