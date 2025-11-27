@@ -38,11 +38,18 @@ AGENT_PASSWORD_BYTES = AGENT_PASSWORD.encode("utf-8") if AGENT_PASSWORD else Non
 shell_lock = threading.Lock()
 
 def choose_start_dir():
-    """Prefer HOME if executable, otherwise stay in current working dir."""
+    """
+    Decide where to start the shell and what to use for $HOME.
+
+    Prefer the user's HOME if it is executable/readable; otherwise fall back to
+    the current working directory to avoid permission-denied errors on startup.
+    """
     home_dir = os.environ.get("HOME") or os.path.expanduser("~")
-    if home_dir and os.access(home_dir, os.X_OK):
-        return home_dir
-    return None
+    if home_dir and os.access(home_dir, os.X_OK | os.R_OK):
+        return home_dir, home_dir, False
+
+    fallback = os.getcwd()
+    return fallback, fallback, True
 
 
 def start_shell():
@@ -59,12 +66,19 @@ def start_shell():
 
         # Spawn default shell
         shell = os.environ.get("SHELL", "/bin/bash")
+        start_dir, home_for_env, skip_rc = choose_start_dir()
+
         env = os.environ.copy()
         env.setdefault("TERM", "xterm-256color")
-        env.setdefault("HOME", os.path.expanduser("~"))
-        start_dir = choose_start_dir()
+        env["HOME"] = home_for_env
+
+        shell_cmd = [shell]
+        if skip_rc and shell.endswith("bash"):
+            # Skip rc files when $HOME is not readable to avoid noisy errors.
+            shell_cmd.extend(["--noprofile", "--norc"])
+
         shell_proc = subprocess.Popen(
-            [shell],
+            shell_cmd,
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
