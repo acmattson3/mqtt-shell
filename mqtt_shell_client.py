@@ -102,11 +102,15 @@ def setup_mqtt():
     # Give each client connection a unique ID so multiple sessions do not kick
     # each other off the broker and enter a reconnect loop.
     client_id = f"mqtt-shell-client-{SESSION_ID}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
-    client = mqtt.Client(
-        client_id=client_id,
-        protocol=mqtt.MQTTv5,
-        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-    )
+    callback_api = getattr(mqtt, "CallbackAPIVersion", None)
+    client_kwargs = {
+        "client_id": client_id,
+        "protocol": mqtt.MQTTv5,
+    }
+    if callback_api:
+        client_kwargs["callback_api_version"] = callback_api.VERSION2
+
+    client = mqtt.Client(**client_kwargs)
 
     if USERNAME:
         client.username_pw_set(USERNAME, MQTT_PASSWORD)

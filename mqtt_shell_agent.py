@@ -152,11 +152,15 @@ def on_message(mqttc, userdata, msg):
 
 def setup_mqtt():
     global client
-    client = mqtt.Client(
-        client_id=f"mqtt-shell-agent-{SESSION_ID}",
-        protocol=mqtt.MQTTv5,
-        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-    )
+    callback_api = getattr(mqtt, "CallbackAPIVersion", None)
+    client_kwargs = {
+        "client_id": f"mqtt-shell-agent-{SESSION_ID}",
+        "protocol": mqtt.MQTTv5,
+    }
+    if callback_api:
+        client_kwargs["callback_api_version"] = callback_api.VERSION2
+
+    client = mqtt.Client(**client_kwargs)
 
     if not BROKER_HOST:
         print("MQTT_HOST is not set or is empty; please configure a broker host.", file=sys.stderr)
