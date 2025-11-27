@@ -41,15 +41,25 @@ def choose_start_dir():
     """
     Decide where to start the shell and what to use for $HOME.
 
-    Prefer the user's HOME if it is executable/readable; otherwise fall back to
-    the current working directory to avoid permission-denied errors on startup.
+    Prefer the user's HOME; if it is not accessible, fall back to /tmp or the
+    current working directory. If we cannot use HOME, skip rc files to avoid
+    noisy permission errors and missing color prompts.
     """
     home_dir = os.environ.get("HOME") or os.path.expanduser("~")
-    if home_dir and os.access(home_dir, os.X_OK | os.R_OK):
-        return home_dir, home_dir, False
+    fallback_dirs = [
+        home_dir,
+        "/tmp",
+        os.getcwd(),
+    ]
 
-    fallback = os.getcwd()
-    return fallback, fallback, True
+    for path in fallback_dirs:
+        if path and os.path.isdir(path) and os.access(path, os.X_OK):
+            # skip_rc is True when we are not landing in the user's HOME
+            return path, home_dir or path, path != home_dir
+
+    # As a last resort, stay put.
+    cwd = os.getcwd()
+    return cwd, home_dir or cwd, cwd != home_dir
 
 
 def start_shell():
@@ -71,11 +81,16 @@ def start_shell():
         env = os.environ.copy()
         env.setdefault("TERM", "xterm-256color")
         env["HOME"] = home_for_env
+        env.setdefault("PS1", "\\u@\\h:\\w$ ")
 
         shell_cmd = [shell]
-        if skip_rc and shell.endswith("bash"):
-            # Skip rc files when $HOME is not readable to avoid noisy errors.
-            shell_cmd.extend(["--noprofile", "--norc"])
+        if shell.endswith("bash"):
+            if skip_rc:
+                # Skip rc files when $HOME is not readable to avoid noisy errors.
+                shell_cmd.extend(["--noprofile", "--norc"])
+            else:
+                # Run as a login shell so colors/prompt are loaded from rc files.
+                shell_cmd.append("-l")
 
         shell_proc = subprocess.Popen(
             shell_cmd,
