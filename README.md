@@ -46,7 +46,28 @@ python3 mqtt_shell_client.py agent-01@broker.example.com
 
 `MQTT_HOST` is taken from the client target. Agent ID is a single topic segment. MQTT broker credentials and agent credentials are distinct. **TLS is strongly recommended**, and broker ACLs should restrict who may publish/subscribe. Without TLS, MQTT topics and timing remain visible and a weak agent password can be subjected to offline guesses, although PTY traffic is encrypted. This is a custom protocol, **not** a drop-in replacement for audited SSH.
 
-`MQTT_TLS=1` enables system-CA TLS validation. Defaults to port 8883 with TLS, 1883 otherwise. Configure hostnames and trusted certificates appropriately.
+`MQTT_TLS=1` enables system-CA TLS validation. For TCP, the default ports are 8883 with TLS and 1883 without TLS. Configure hostnames and trusted certificates appropriately.
+
+### MQTT over secure WebSockets (WSS)
+
+Set these variables on **both** agent and client when your broker is behind an HTTPS reverse proxy (such as Cloudflare):
+
+```sh
+export MQTT_HOST=mqtt.sssn.us MQTT_TRANSPORT=websockets MQTT_TLS=1 MQTT_PORT=443
+export MQTT_WS_PATH=/mqtt  # change to / if that is your broker's exposed WSS path
+export MQTT_USER=acmattson3
+# supply MQTT_PASSWORD securely at runtime; do not commit broker secrets
+```
+
+Paho creates a WebSocket connection to `wss://mqtt.sssn.us:443/mqtt`, performs the normal MQTT broker login **inside** that connection, and uses the same MQTT topics as TCP mode. A WebSocket endpoint must be configured in the broker and correctly routed through the reverse proxy. The WebSocket path differs between deployments; the default `/mqtt` is not a verified path for your server.
+
+Run the broker smoke test to check authentication **and** publish/subscribe permissions before launching an agent:
+
+```sh
+python3 tools/probe_broker.py
+```
+
+The probe uses an ephemeral, unpredictable topic under `mqtt-shell-probe/` and waits for its own published message to be delivered. It does not expose a shell. A successful probe only establishes MQTT WebSocket connectivity with your credentials, not agent functionality. The test and application never print the broker password. Do not run this against brokers you do not own or have permission to test.
 
 ## Serial / transparent LoRa mode (experimental)
 
