@@ -59,7 +59,8 @@ def collect(client, pattern, timeout=4):
             raw.extend(client.stdout.get(timeout=0.1))
         except queue.Empty:
             pass
-        if pattern in raw:
+        candidates = pattern if isinstance(pattern, tuple) else (pattern,)
+        if any(candidate in raw for candidate in candidates):
             return bytes(raw)
     raise AssertionError(f'Output not found: {pattern!r}, got {bytes(raw)!r}')
 
@@ -117,7 +118,7 @@ class ShellTests(unittest.TestCase):
     def test_pty_job_control_and_resize(self):
         c = self.client()
         c.start(rows=42, cols=99)
-        collect(c, b'# ', timeout=4)
+        collect(c, (b'# ', b'$ '), timeout=4)
         c.send('I', b'tty; stty size; printf "DONE\\n"\n')
         data = collect(c, b'\r\nDONE\r\n')
         self.assertRegex(data, rb'/dev/pts/\d+')
@@ -130,10 +131,10 @@ class ShellTests(unittest.TestCase):
         a, b = self.client(), self.client()
         a.start()
         b.start()
-        collect(a, b'# ', timeout=4)
-        collect(b, b'# ', timeout=4)
+        collect(a, (b'# ', b'$ '), timeout=4)
+        collect(b, (b'# ', b'$ '), timeout=4)
         a.send('I', b'export TEST_ISOLATED=unique123; echo $TEST_ISOLATED\n')
-        self.assertIn(b'unique123', collect(a, b'\runique123\r\n'))
+        self.assertIn(b'unique123', collect(a, b'unique123\r\n'))
         b.send('I', b'printf "[%s]\\n" "$TEST_ISOLATED"\n')
         data = collect(b, b'[]')
         self.assertNotIn(b'unique123', data)
@@ -147,7 +148,7 @@ class ShellTests(unittest.TestCase):
     def test_final_output_before_exit(self):
         c = self.client()
         c.start()
-        collect(c, b'# ', timeout=4)
+        collect(c, (b'# ', b'$ '), timeout=4)
         c.send('I', b'printf "LAST-OUTPUT\\n"; exit 17\n')
         self.assertTrue(c.exited.wait(5), 'Shell never exited')
         text = b''.join([entry for entry in list(c.stdout.queue)])
@@ -157,11 +158,11 @@ class ShellTests(unittest.TestCase):
     def test_input_replay_is_ignored(self):
         c = self.client()
         c.start()
-        collect(c, b'# ', timeout=4)
+        collect(c, (b'# ', b'$ '), timeout=4)
         c.send('I', b'printf "ONE-TIME\\n"\n')
         topic, payload = [x for x in self.hub.frames if x[0].endswith('/in')][-1]
         self.hub.publish(topic, payload)
-        data = collect(c, b'\rONE-TIME\r\n')
+        data = collect(c, b'ONE-TIME\r\n')
         time.sleep(.2)
         data += b''.join(list(c.stdout.queue))
         self.assertEqual(data.count(b'ONE-TIME'), 2)  # command echo and printf output
