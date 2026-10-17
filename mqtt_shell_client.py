@@ -1,209 +1,186 @@
 #!/usr/bin/env python3
-import os
-import sys
-import select
-import termios
-import tty
-import queue
-import threading
+"""Local interactive terminal client for MQTT shell protocol v2."""
+import fcntl
 import getpass
-import uuid
-import paho.mqtt.client as mqtt
-
-# ==== STATIC CONFIG (things you probably won't change often) ====
-# Broker can be overridden by CLI target; start with env default.
-BROKER_HOST = os.environ.get("MQTT_HOST")
-BROKER_PORT = int(os.environ.get("MQTT_PORT", "1883"))
-USE_TLS     = False
-# ================================================================
-
-# These will be set at runtime after parsing the ssh-style target
-USERNAME    = None
-SESSION_ID  = None
-MQTT_USERNAME = os.environ.get("MQTT_USER") or os.environ.get("MQTT_USERNAME")
-MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD") or os.environ.get("MQTT_PASS")
-AGENT_PASSWORD = os.environ.get("MQTT_AGENT_PASSWORD") or os.environ.get("AGENT_PASSWORD")
-
-client = None
-stdout_queue: "queue.Queue[bytes]" = queue.Queue()
-connected_event = threading.Event()
-auth_ok_event = threading.Event()
-remote_exit_event = threading.Event()
-
-# These are computed after SESSION_ID is known
-TOPIC_BASE  = None
-TOPIC_STDIN = None
-TOPIC_STDOUT = None
-TOPIC_STATUS = None
-TOPIC_AUTH = None
+import os
+import queue
+import select
+import shutil
+import signal
+import struct
+import sys
+import termios
+import threading
+import tty
+from mqtt_shell_protocol import VERSION, Cipher, decode, encode, nonce, session_material
+from mqtt_shell_transport import make_transport
 
 
-def build_topics():
-    global TOPIC_BASE, TOPIC_STDIN, TOPIC_STDOUT, TOPIC_STATUS, TOPIC_AUTH
-    if SESSION_ID is None:
-        raise RuntimeError("SESSION_ID not set before building topics")
-    TOPIC_BASE   = f"mqtt-shell/{SESSION_ID}"
-    TOPIC_STDIN  = TOPIC_BASE + "/stdin"
-    TOPIC_STDOUT = TOPIC_BASE + "/stdout"
-    TOPIC_STATUS = TOPIC_BASE + "/status"
-    TOPIC_AUTH   = TOPIC_BASE + "/auth"
+class Client:
+    def __init__(self, agent_id, secret, transport=None):
+        if not agent_id or '/' in agent_id:
+            raise ValueError('Invalid agent ID')
+        self.root = f'mqtt-shell/{agent_id}'
+        self.sid = nonce()
+        self.cn = nonce()
+        self.secret = secret
+        self.cipher = None
+        self.ready = threading.Event()
+        self.exited = threading.Event()
+        self.error = None
+        self.exit_code = None
+        self.stdout = queue.Queue()
+        self.lock = threading.Lock()
+        self.transport = transport or make_transport(self.on_message,
+            [f'{self.root}/session/{self.sid}/control',
+             f'{self.root}/session/{self.sid}/out'], 'client')
+
+    def on_message(self, topic, payload):
+        if topic == f'{self.root}/session/{self.sid}/control':
+            message = decode(payload)
+            if message.get('type') == 'challenge':
+                proof, key = session_material(self.secret, self.sid, self.cn, message['nonce'])
+                with self.lock:
+                    self.cipher = Cipher(key, self.sid, sender='client')
+                self.transport.publish(f'{self.root}/session/{self.sid}/auth',
+                                       encode({'v': VERSION, 'proof': proof}))
+            elif message.get('type') == 'fail':
+                self.error = 'Authentication failed or PTY unavailable'
+                self.ready.set()
+        elif topic == f'{self.root}/session/{self.sid}/out':
+            with self.lock:
+                if self.cipher is None:
+                    return
+                packet = self.cipher.open(payload)
+            if packet is None:
+                return
+            kind, data = packet
+            if kind == 'K':
+                self.ready.set()
+            elif kind == 'O':
+                self.stdout.put(data)
+            elif kind == 'X':
+                if len(data) == 4:
+                    self.exit_code = struct.unpack('>i', data)[0]
+                self.exited.set()
+
+    def start(self, rows=24, cols=80):
+        self.transport.start()
+        self.transport.publish(self.root + '/hello', encode({
+            'v': VERSION, 'id': self.sid, 'nonce': self.cn,
+            'rows': rows, 'cols': cols}))
+        if not self.ready.wait(timeout=20):
+            raise TimeoutError('Agent did not respond to handshake')
+        if self.error:
+            raise PermissionError(self.error)
+
+    def send(self, kind, payload=b''):
+        with self.lock:
+            if self.cipher is None or not self.ready.is_set() or self.error:
+                raise RuntimeError('Session not authenticated')
+            packet = self.cipher.seal(kind, payload)
+            self.transport.publish(f'{self.root}/session/{self.sid}/in', packet)
+
+    def resize(self, rows, cols):
+        self.send('R', struct.pack('>HH', rows, cols))
+
+    def close(self):
+        if self.ready.is_set() and not self.exited.is_set() and not self.error:
+            try:
+                self.send('C')
+            except Exception:
+                pass
+        self.transport.close()
 
 
-def parse_target_arg(argv):
-    """
-    Parse ssh-like target: [mqtt-user@]<agent-id>@<broker-host>
-
-    - mqtt-user (optional) -> MQTT username override
-    - agent-id -> SESSION_ID (remote agent ID and topic suffix)
-    - broker-host -> MQTT broker hostname
-    """
-    if len(argv) < 2:
-        print("Usage: mqtt_shell_client.py [mqtt-user@]<agent-id>@<broker-host>", file=sys.stderr)
-        sys.exit(1)
-
-    target = argv[1]
-    parts = target.split("@")
-
+def parse_target(value):
+    parts = value.split('@')
     if len(parts) == 2:
-        agent_id, broker_host = parts
-        user = None
+        user, agent, host = None, parts[0], parts[1]
     elif len(parts) == 3:
-        user, agent_id, broker_host = parts
+        user, agent, host = parts
     else:
-        print("Target must look like [mqtt-user@]<agent-id>@<broker-host>", file=sys.stderr)
-        sys.exit(1)
-
-    return user, agent_id, broker_host
-
-
-def on_connect(mqttc, userdata, flags, reason_code, properties=None):
-    print(f"[mqtt-shell] Connected to broker (code {reason_code}).", file=sys.stderr)
-    connected_event.set()
-    mqttc.subscribe([(TOPIC_STDOUT, 0), (TOPIC_STATUS, 1)])
+        raise ValueError('Expected [mqtt-user@]agent-id@broker-host')
+    if not agent or not host:
+        raise ValueError('Agent ID and broker host required')
+    return user, agent, host
 
 
-def on_message(mqttc, userdata, msg):
-    if msg.topic == TOPIC_STDOUT:
-        stdout_queue.put(msg.payload)
-    elif msg.topic == TOPIC_STATUS:
-        try:
-            text = msg.payload.decode("utf-8", errors="replace")
-        except Exception:
-            text = repr(msg.payload)
-        print(f"[status] {text}", file=sys.stderr)
-        if text == "auth-ok":
-            auth_ok_event.set()
-        if text == "shell-exited":
-            remote_exit_event.set()
-
-
-def setup_mqtt():
-    global client
-    # Give each client connection a unique ID so multiple sessions do not kick
-    # each other off the broker and enter a reconnect loop.
-    client_id = f"mqtt-shell-client-{SESSION_ID}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
-    callback_api = getattr(mqtt, "CallbackAPIVersion", None)
-    client_kwargs = {
-        "client_id": client_id,
-        "protocol": mqtt.MQTTv5,
-    }
-    if callback_api:
-        client_kwargs["callback_api_version"] = callback_api.VERSION2
-
-    client = mqtt.Client(**client_kwargs)
-
-    if USERNAME:
-        client.username_pw_set(USERNAME, MQTT_PASSWORD)
-
-    if USE_TLS:
-        client.tls_set()
-
-    client.on_connect = on_connect
-    client.on_message = on_message
-
-    client.connect(BROKER_HOST, BROKER_PORT, keepalive=60)
-    client.loop_start()
-
-
-def writer_loop():
-    """Pull data from stdout_queue and write to local stdout."""
-    while True:
-        data = stdout_queue.get()
-        if data is None:
-            break
-        os.write(sys.stdout.fileno(), data)
-        sys.stdout.flush()
-
-
-def main():
-    global USERNAME, SESSION_ID, MQTT_PASSWORD, AGENT_PASSWORD, BROKER_HOST
-
-    # Parse [user@]session_id from command line
-    user_override, agent_id, broker_host = parse_target_arg(sys.argv)
-    SESSION_ID = agent_id
-    BROKER_HOST = broker_host or BROKER_HOST
-
-    if not BROKER_HOST:
-        print("MQTT broker host is missing; set MQTT_HOST or include it in the target.", file=sys.stderr)
-        sys.exit(1)
-
-    # Resolve MQTT username: CLI override > env > prompt
-    USERNAME = user_override or MQTT_USERNAME
-    if not USERNAME:
-        USERNAME = input("MQTT broker username: ").strip()
-    if not USERNAME:
-        print("MQTT broker username is required.", file=sys.stderr)
-        sys.exit(1)
-
-    if not MQTT_PASSWORD:
-        MQTT_PASSWORD = getpass.getpass("MQTT broker password: ")
-    if not AGENT_PASSWORD:
-        AGENT_PASSWORD = getpass.getpass(f"Agent password for {SESSION_ID}: ")
-
-    # Now that SESSION_ID is known, build topics
-    build_topics()
-
-    setup_mqtt()
-
-    if not connected_event.wait(timeout=5):
-        print("Failed to connect to MQTT broker; giving up.", file=sys.stderr)
-        sys.exit(1)
-
-    # Authenticate to the remote agent before sending any input
-    client.publish(TOPIC_AUTH, AGENT_PASSWORD.encode("utf-8"), qos=1)
-
-    if not auth_ok_event.wait(timeout=5):
-        print("Agent authentication failed or timed out.", file=sys.stderr)
-        client.loop_stop()
-        client.disconnect()
-        sys.exit(1)
-
-    # Put terminal into raw mode so ^C, arrows, etc. go through as bytes
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    tty.setraw(fd)
-
-    writer_thread = threading.Thread(target=writer_loop, daemon=True)
-    writer_thread.start()
-
+def terminal_size(fd):
     try:
-        while True:
-            if remote_exit_event.is_set():
-                break
+        packed = fcntl.ioctl(fd, termios.TIOCGWINSZ, b'\0' * 8)
+        rows, cols, _, _ = struct.unpack('HHHH', packed)
+        return max(rows, 1), max(cols, 1)
+    except OSError:
+        size = shutil.get_terminal_size()
+        return size.lines, size.columns
 
-            rlist, _, _ = select.select([fd], [], [], 0.1)
-            if fd in rlist:
+
+def interactive(client):
+    fd = sys.stdin.fileno()
+    if not os.isatty(fd):
+        raise RuntimeError('Interactive client requires a TTY on stdin')
+    old_settings = termios.tcgetattr(fd)
+    old_sigwinch = signal.getsignal(signal.SIGWINCH)
+    stop_writer = object()
+
+    def writer():
+        while True:
+            chunk = client.stdout.get()
+            if chunk is stop_writer:
+                break
+            os.write(sys.stdout.fileno(), chunk)
+
+    worker = threading.Thread(target=writer, daemon=True)
+    worker.start()
+    try:
+        tty.setraw(fd)
+
+        def resized(sig=None, frame=None):
+            client.resize(*terminal_size(fd))
+
+        signal.signal(signal.SIGWINCH, resized)
+        resized()
+        while not client.exited.is_set():
+            ready, _, _ = select.select([fd], [], [], 0.1)
+            if ready:
                 data = os.read(fd, 1024)
                 if not data:
                     break
-                client.publish(TOPIC_STDIN, data, qos=0)
+                client.send('I', data)
     finally:
+        signal.signal(signal.SIGWINCH, old_sigwinch)
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        stdout_queue.put(None)
-        if client:
-            client.loop_stop()
-            client.disconnect()
+        client.stdout.put(stop_writer)
+        worker.join(timeout=3)
 
 
-if __name__ == "__main__":
+def main():
+    if len(sys.argv) != 2:
+        raise SystemExit('Usage: mqtt_shell_client.py [mqtt-user@]agent-id@broker-host (or agent-id in serial mode)')
+    if os.environ.get('SHELL_TRANSPORT', 'mqtt').lower() == 'serial':
+        agent = sys.argv[1]
+    else:
+        username, agent, host = parse_target(sys.argv[1])
+        os.environ['MQTT_HOST'] = host
+        if username:
+            os.environ['MQTT_USER'] = username
+        if not os.environ.get('MQTT_USER'):
+            os.environ['MQTT_USER'] = input('MQTT broker username: ').strip()
+        if not os.environ.get('MQTT_PASSWORD'):
+            os.environ['MQTT_PASSWORD'] = getpass.getpass('MQTT broker password: ')
+    secret = os.environ.get('MQTT_AGENT_PASSWORD') or os.environ.get('AGENT_PASSWORD')
+    if not secret:
+        secret = getpass.getpass(f'Agent password for {agent}: ')
+    client = Client(agent, secret)
+    try:
+        client.start(*terminal_size(sys.stdin.fileno()))
+        interactive(client)
+    finally:
+        client.close()
+    if client.exit_code not in (None, 0):
+        raise SystemExit(client.exit_code if client.exit_code > 0 else 1)
+
+
+if __name__ == '__main__':
     main()

@@ -1,5 +1,5 @@
 [Unit]
-Description=MQTT Remote Shell Agent
+Description=MQTT or serial remote shell agent
 After=network-online.target
 Wants=network-online.target
 
@@ -8,27 +8,14 @@ Type=simple
 User=mqttshell
 Group=mqttshell
 WorkingDirectory=/opt/mqtt-shell
-
-# Environment variables for credentials
-Environment="MQTT_HOST=broker.example.com"
-Environment="MQTT_PORT=1883"
-Environment="MQTT_USER=yourusername"
-Environment="MQTT_PASSWORD=your-broker-password"
-Environment="MQTT_AGENT_PASSWORD=unique-agent-secret"
-Environment="MQTT_ID=agent-01"
-
+EnvironmentFile=/etc/mqtt-shell-agent.env
 ExecStart=/usr/bin/python3 /opt/mqtt-shell/mqtt_shell_agent.py
-
-Restart=always
+Restart=on-failure
 RestartSec=3
-
-# Hardening (optional; relax these if you need full login behavior)
-NoNewPrivileges=false
+NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=off
+ProtectSystem=strict
 ProtectHome=false
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target
