@@ -17,19 +17,29 @@ class MQTTTransport:
         host = os.environ.get('MQTT_HOST', '').strip()
         if not host:
             raise ValueError('MQTT_HOST is required')
-        port = int(os.environ.get('MQTT_PORT', '8883' if os.environ.get('MQTT_TLS') == '1' else '1883'))
+        mode = os.environ.get('MQTT_TRANSPORT', 'tcp').strip().lower()
+        if mode not in ('tcp', 'websockets'):
+            raise ValueError('MQTT_TRANSPORT must be tcp or websockets')
+        tls = os.environ.get('MQTT_TLS') == '1'
+        default_port = (443 if tls else 80) if mode == 'websockets' else (8883 if tls else 1883)
+        port = int(os.environ.get('MQTT_PORT', str(default_port)))
+        ws_path = os.environ.get('MQTT_WS_PATH', '/mqtt')
+        if mode == 'websockets' and not ws_path.startswith('/'):
+            raise ValueError('MQTT_WS_PATH must begin with /')
         user = os.environ.get('MQTT_USER') or os.environ.get('MQTT_USERNAME')
         password = os.environ.get('MQTT_PASSWORD') or os.environ.get('MQTT_PASS')
         kwargs = {'client_id': f'mqtt-shell-{self.client_tag}-{uuid.uuid4().hex[:10]}',
-                  'protocol': mqtt.MQTTv5}
+                  'protocol': mqtt.MQTTv5, 'transport': mode}
         if hasattr(mqtt, 'CallbackAPIVersion'):
             kwargs['callback_api_version'] = mqtt.CallbackAPIVersion.VERSION2
         self.client = mqtt.Client(**kwargs)
+        if mode == 'websockets':
+            self.client.ws_set_options(path=ws_path)
         if user:
             if password is None:
                 raise ValueError('MQTT_PASSWORD is required when MQTT_USER is set')
             self.client.username_pw_set(user, password)
-        if os.environ.get('MQTT_TLS') == '1':
+        if tls:
             self.client.tls_set()
 
         def connected(client, userdata, flags, reason_code, properties=None):
