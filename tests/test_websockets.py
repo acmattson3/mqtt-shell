@@ -106,6 +106,21 @@ def test_custom_path_and_port(monkeypatch, fake_mqtt):
         connection.close()
 
 
+def test_paho_v5_reason_code_object(monkeypatch, fake_mqtt):
+    monkeypatch.setenv('MQTT_HOST', 'broker.local')
+    monkeypatch.setenv('MQTT_TRANSPORT', 'websockets')
+
+    def loop_start(client):
+        client.on_connect(client, None, None, types.SimpleNamespace(value=0))
+
+    monkeypatch.setattr(FakeMQTTClient, 'loop_start', loop_start)
+    connection = MQTTTransport(lambda topic, body: None, [], 'test')
+    try:
+        connection.start()
+    finally:
+        connection.close()
+
+
 def test_plain_mqtt_defaults(monkeypatch, fake_mqtt):
     monkeypatch.setenv('MQTT_HOST', 'broker.local')
     monkeypatch.delenv('MQTT_TRANSPORT', raising=False)

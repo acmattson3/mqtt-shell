@@ -54,12 +54,12 @@ Set these variables on **both** agent and client when your broker is behind an H
 
 ```sh
 export MQTT_HOST=mqtt.sssn.us MQTT_TRANSPORT=websockets MQTT_TLS=1 MQTT_PORT=443
-export MQTT_WS_PATH=/mqtt  # change to / if that is your broker's exposed WSS path
+export MQTT_WS_PATH=/mqtt  # confirmed for mqtt.sssn.us; other brokers may use /
 export MQTT_USER=acmattson3
 # supply MQTT_PASSWORD securely at runtime; do not commit broker secrets
 ```
 
-Paho creates a WebSocket connection to `wss://mqtt.sssn.us:443/mqtt`, performs the normal MQTT broker login **inside** that connection, and uses the same MQTT topics as TCP mode. A WebSocket endpoint must be configured in the broker and correctly routed through the reverse proxy. The WebSocket path differs between deployments; the default `/mqtt` is not a verified path for your server.
+Paho creates a WebSocket connection to `wss://mqtt.sssn.us:443/mqtt`, performs the normal MQTT broker login **inside** that connection, and uses the same MQTT topics as TCP mode. The `/mqtt` path, TLS certificate validation, broker authentication, and QoS 1 publish/subscribe have been verified against `mqtt.sssn.us`. A WebSocket endpoint must be configured in the broker and correctly routed through the reverse proxy. Other deployments may use a different path, such as `/`.
 
 Run the broker smoke test to check authentication **and** publish/subscribe permissions before launching an agent:
 

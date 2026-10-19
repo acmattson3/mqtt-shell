@@ -44,7 +44,9 @@ class MQTTTransport:
             self.client.tls_set()
 
         def connected(client, userdata, flags, reason_code, properties=None):
-            if int(reason_code) != 0:
+            # Paho 2.x supplies a ReasonCode object for MQTT v5 callbacks;
+            # older versions and test doubles may supply an integer.
+            if getattr(reason_code, 'value', reason_code) != 0:
                 return
             if not self.subscriptions:
                 self.subscriptions_ready.set()
