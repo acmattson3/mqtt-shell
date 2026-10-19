@@ -35,6 +35,7 @@ class FakeMQTTClient:
 
     def subscribe(self, topic, qos):
         self.subscriptions.append((topic, qos))
+        self.on_subscribe(self, None, len(self.subscriptions), [0])
 
     def disconnect(self):
         pass

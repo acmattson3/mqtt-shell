@@ -9,6 +9,7 @@ class MQTTTransport:
         self.callback = callback
         self.subscriptions = subscriptions
         self.ready = threading.Event()
+        self.subscriptions_ready = threading.Event()
         self.client = None
         self.client_tag = client_tag
 
@@ -45,9 +46,24 @@ class MQTTTransport:
         def connected(client, userdata, flags, reason_code, properties=None):
             if int(reason_code) != 0:
                 return
+            if not self.subscriptions:
+                self.subscriptions_ready.set()
             for topic in self.subscriptions:
                 client.subscribe(topic, qos=1)
             self.ready.set()
+
+        def subscribed(client, userdata, mid, reason_codes, properties=None):
+            # Paho invokes on_subscribe once for each SUBSCRIBE packet. Treat any
+            # rejected filter as a failed startup rather than publishing into a
+            # subscription that the broker never accepted.
+            if any(getattr(code, 'is_failure', False) for code in reason_codes):
+                return
+            if not self.subscriptions:
+                self.subscriptions_ready.set()
+                return
+            self._suback_count += 1
+            if self._suback_count >= len(self.subscriptions):
+                self.subscriptions_ready.set()
 
         def received(client, userdata, msg):
             try:
@@ -57,12 +73,17 @@ class MQTTTransport:
                 logging.exception('Bad message on %s: %s', msg.topic, exc)
 
         self.client.on_connect = connected
+        self._suback_count = 0
+        self.client.on_subscribe = subscribed
         self.client.on_message = received
         self.client.connect(host, port, keepalive=60)
         self.client.loop_start()
         if not self.ready.wait(timeout=10):
             self.close()
             raise TimeoutError('Cannot connect to MQTT broker')
+        if not self.subscriptions_ready.wait(timeout=10):
+            self.close()
+            raise TimeoutError('Cannot subscribe to MQTT topics')
 
     def publish(self, topic, payload):
         if self.client is None:
