@@ -1,85 +1,117 @@
 # mqtt-shell
 
-A purely MQTT-based SSH-style shell that uses MQTT for transport and a per-agent password for authorization.
+An SSH-style **remote terminal**, not an SSH server. The agent launches a real Linux PTY. A client connects over either MQTT or a **transparent serial link**, including a serial LoRa modem or MCU radio bridge.
 
-## What this does
-- An agent runs on the remote machine and exposes a pseudo-TTY over MQTT topics.
-- A client connects to the same broker, authenticates to the agent with an agent-specific password, and streams stdin/stdout over MQTT.
-- MQTT broker credentials (`MQTT_USER`/`MQTT_PASSWORD`) are shared across all agents, while each agent has its own `MQTT_AGENT_PASSWORD`.
+## What changed in protocol v2
 
-## Prerequisites
-- Python 3.9+ on both agent and client hosts.
-- `paho-mqtt` installed: `pip install paho-mqtt`
-- An MQTT broker reachable by both sides.
+- Independent sessions with unpredictable IDs, so two clients no longer share a shell or authentication state.
+- Challenge-response authentication: the agent password is **never transmitted directly**.
+- ChaCha20-Poly1305 authenticated encryption of stdin, stdout, resizing, and exit messages; frame counters reject duplicates and replays.
+- A proper controlling terminal, terminal resizing (`SIGWINCH`), orderly exit status, and stdout drain before session close.
+- MQTT QoS 1 for commands and output, or a small serial radio protocol with packet framing, CRC-16, 90-byte fragments, acknowledgments, and retries.
+- Functional integration tests that run actual Bash instances and simulate dropped serial packets.
 
-## Configuration
-### Environment variables (agent)
-- `MQTT_HOST` (required): Broker hostname/IP.
-- `MQTT_PORT` (optional, default `1883`): Broker port.
-- `MQTT_USER` (required): MQTT username.
-- `MQTT_PASSWORD` (required): MQTT password (shared across all agents/clients).
-- `MQTT_ID` (required): Unique agent/session identifier; used to build topics.
-- `MQTT_AGENT_PASSWORD` (required): Per-agent secret used to authorize clients.
+**Breaking change:** v2 clients cannot speak to v1 agents. Upgrade both endpoints together.
 
-### Environment variables (client)
-- `MQTT_HOST` / `MQTT_PORT`: Defaults for broker host/port; can be overridden in the CLI target.
-- `MQTT_USER`: MQTT username. If omitted, you'll be prompted.
-- `MQTT_PASSWORD`: MQTT broker password. If omitted, you'll be prompted.
-- `MQTT_AGENT_PASSWORD`: Agent password. If omitted, you will be prompted per connection.
+## Install
 
-## Running the agent
-### Quick run
-```bash
-export MQTT_HOST=broker.example.com
-export MQTT_PORT=1883
-export MQTT_USER=your-broker-user
-export MQTT_PASSWORD=your-broker-password
-export MQTT_AGENT_PASSWORD=unique-agent-secret
+Linux and Python 3.9+ are required for the agent. Client terminal support also targets Unix/Linux/macOS.
+
+```sh
+python3 -m pip install -r requirements.txt
+```
+
+For MQTT, both endpoints need broker connectivity, and `paho-mqtt`. For serial, both endpoints need `pyserial` and a **bidirectional transparent UART connection**. Connecting two raw SX1262/SX1276 SPI modules directly is *not* supported. Those modules need suitable radio bridge firmware. A transparent serial LoRa modem works without custom host-side radio drivers.
+
+## MQTT mode
+
+Agent:
+
+```sh
+export MQTT_HOST=broker.example.com MQTT_PORT=8883 MQTT_TLS=1
+export MQTT_USER=your-broker-user MQTT_PASSWORD=your-broker-secret
 export MQTT_ID=agent-01
-
+export MQTT_AGENT_PASSWORD="$(openssl rand -hex 32)"  # save this same secret for client
 python3 mqtt_shell_agent.py
 ```
 
-### systemd service
-1) Copy `mqtt-shell-agent.service` to `/etc/systemd/system/mqtt-shell-agent.service`.
-2) Update the `Environment=` lines to match your broker, agent ID, and passwords.
-3) Reload and start:
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now mqtt-shell-agent
-sudo systemctl status mqtt-shell-agent
-```
-The bundled service file is tuned for an SSH-like experience (no `NoNewPrivileges`, `ProtectHome=false`, `ProtectSystem=off`) so `sudo`, login shell config, and colors work as expected. If you want a more locked-down service, re-enable those hardening directives after testing.
-If you see permission errors like `Permission denied` when reading `~/.bashrc` or `cd ~`, double-check that `ProtectHome=false` in the unit file and that the service user actually owns its home directory.
+Client (use the *same* `MQTT_AGENT_PASSWORD` as the agent):
 
-## Running the client
-```bash
-export MQTT_HOST=broker.example.com
-export MQTT_PORT=1883
-export MQTT_PASSWORD=your-broker-password   # shared MQTT secret
-# export MQTT_USER=your-broker-user         # if not set, you'll be prompted
-# export MQTT_AGENT_PASSWORD=unique-agent-secret  # if not set, you'll be prompted
-
+```sh
+export MQTT_PORT=8883 MQTT_TLS=1
+export MQTT_USER=your-broker-user MQTT_PASSWORD=your-broker-secret
+export MQTT_AGENT_PASSWORD=the-agent-secret
 python3 mqtt_shell_client.py agent-01@broker.example.com
-# or with an explicit MQTT username (optional prefix):
-# python3 mqtt_shell_client.py mqttuser@agent-01@broker.example.com
 ```
 
-The client will:
-1) Connect to the MQTT broker at `<broker-host>` using `MQTT_USER` (from env or the optional prefix) and `MQTT_PASSWORD`.
-2) Send the `MQTT_AGENT_PASSWORD` to the agent over a dedicated auth topic for `<agent-id>`.
-3) Enter a raw TTY session once it receives `auth-ok`. Incorrect or missing passwords result in `auth-fail`.
+`MQTT_HOST` is taken from the client target. Agent ID is a single topic segment. MQTT broker credentials and agent credentials are distinct. **TLS is strongly recommended**, and broker ACLs should restrict who may publish/subscribe. Without TLS, MQTT topics and timing remain visible and a weak agent password can be subjected to offline guesses, although PTY traffic is encrypted. This is a custom protocol, **not** a drop-in replacement for audited SSH.
 
-## Topics
-- `mqtt-shell/<MQTT_ID>/stdin` – client -> agent (shell input)
-- `mqtt-shell/<MQTT_ID>/stdout` – agent -> client (shell output)
-- `mqtt-shell/<MQTT_ID>/status` – status messages (`agent-online`, `auth-ok`, `auth-fail`, `shell-exited`, etc.)
-- `mqtt-shell/<MQTT_ID>/auth` – client -> agent (agent password)
+`MQTT_TLS=1` enables system-CA TLS validation. For TCP, the default ports are 8883 with TLS and 1883 without TLS. Configure hostnames and trusted certificates appropriately.
 
-## Notes & tips
-- Each agent must have a unique `MQTT_ID`; clients connect with `[user@]<MQTT_ID>`.
-- The MQTT broker password is shared; the agent password is unique per agent for an extra layer of protection.
-- If you see `auth-required` in status, ensure the agent password matches between client and agent.
-- TLS is supported by setting `USE_TLS=True` in code; customize certificates as needed.
-- The agent launches your shell in a real PTY session (`TERM` defaults to `xterm-256color`) so prompts, colors, and job control behave like SSH.
-- When the remote shell exits, the client now exits cleanly after printing the `shell-exited` status message.
+### MQTT over secure WebSockets (WSS)
+
+Set these variables on **both** agent and client when your broker is behind an HTTPS reverse proxy (such as Cloudflare):
+
+```sh
+export MQTT_HOST=mqtt.sssn.us MQTT_TRANSPORT=websockets MQTT_TLS=1 MQTT_PORT=443
+export MQTT_WS_PATH=/mqtt  # confirmed for mqtt.sssn.us; other brokers may use /
+export MQTT_USER=acmattson3
+# supply MQTT_PASSWORD securely at runtime; do not commit broker secrets
+```
+
+Paho creates a WebSocket connection to `wss://mqtt.sssn.us:443/mqtt`, performs the normal MQTT broker login **inside** that connection, and uses the same MQTT topics as TCP mode. The `/mqtt` path, TLS certificate validation, broker authentication, and QoS 1 publish/subscribe have been verified against `mqtt.sssn.us`. A WebSocket endpoint must be configured in the broker and correctly routed through the reverse proxy. Other deployments may use a different path, such as `/`.
+
+Run the broker smoke test to check authentication **and** publish/subscribe permissions before launching an agent:
+
+```sh
+python3 tools/probe_broker.py
+```
+
+The probe uses an ephemeral, unpredictable topic under `mqtt-shell-probe/` and waits for its own published message to be delivered. It does not expose a shell. A successful probe only establishes MQTT WebSocket connectivity with your credentials, not agent functionality. The test and application never print the broker password. Do not run this against brokers you do not own or have permission to test.
+
+## Serial / transparent LoRa mode (experimental)
+
+Connect a transparent full-duplex UART tunnel between Linux computers using supported serial radios or two MCUs running compatible radio bridge firmware. Each end uses its **own** serial device path.
+
+Agent:
+
+```sh
+export SHELL_TRANSPORT=serial SHELL_SERIAL_PORT=/dev/ttyUSB0
+export SHELL_SERIAL_BAUD=9600 MQTT_ID=agent-01
+export MQTT_AGENT_PASSWORD=your-shared-high-entropy-secret
+python3 mqtt_shell_agent.py
+```
+
+Client:
+
+```sh
+export SHELL_TRANSPORT=serial SHELL_SERIAL_PORT=/dev/ttyUSB0
+export SHELL_SERIAL_BAUD=9600 MQTT_AGENT_PASSWORD=your-shared-high-entropy-secret
+python3 mqtt_shell_client.py agent-01
+```
+
+Serial settings:
+
+- `SHELL_SERIAL_ACK_TIMEOUT` defaults to 4 seconds. Increase for slow LoRa spreading factors.
+- `SHELL_SERIAL_RETRIES` defaults to 12 retries per fragment. If exhausted, the link stops; reconnect/restart both endpoints.
+- Stop-and-wait retransmission makes output reliable under moderate packet loss, but deliberately limits throughput.
+- This adapter assumes transparent **byte-stream** radio behavior and is not optimized for LoRaWAN, duty-cycle limits, or SX-series SPI modules. Confirm applicable radio regulations and module limits before transmitting. Physical LoRa links have not been tested here.
+
+## Running as a systemd service
+
+The included `mqtt-shell-agent.service` uses `/etc/mqtt-shell-agent.env` for secrets and a dedicated `mqttshell` user. Create that user and its home directory, install this repository under `/opt/mqtt-shell`, and secure the environment file (`chmod 600`). Adjust paths and service user for your setup. The shell executes with the service account's permissions, **not as the MQTT client username**. Avoid running the agent as root.
+
+## Tests
+
+```sh
+python3 -m pytest -q
+```
+
+These tests cover cryptography, authentication rejection, replay protection, session isolation, PTY and resizing, exit output, binary radio framing, dropped frames, and a real shell carried over a simulated radio. They do **not** establish that the implementation is security-audited or that a specific physical LoRa module works.
+
+## Limitations
+
+- The session is terminated if the shell or agent exits. Resume after network loss is not yet implemented.
+- QoS 1 helps MQTT recover transient transmission loss, but broker outages can still interrupt an interactive session. The custom serial transport retries each fragment and gives up after a configured limit.
+- Protocol v2 supports a PTY, not SSH file transfer, SSH agent forwarding, port forwarding, or native SSH authentication.
+- Full-screen interactive editors can be slow over low-bit-rate LoRa. Keep command output small and prefer simple text commands.
